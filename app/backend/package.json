@@ -1,0 +1,22 @@
+{
+  "name": "synthetic-identity-detector-backend",
+  "version": "1.0.0",
+  "description": "Backend API for synthetic identity detection using multi-source data correlation",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "nodemon server.js"
+  },
+  "keywords": ["fraud-detection", "identity-verification", "api"],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.18.2",
+    "helmet": "^7.1.0",
+    "morgan": "^1.10.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.2"
+  }
+}
