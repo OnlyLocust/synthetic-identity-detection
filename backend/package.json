@@ -5,10 +5,11 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "dev": "node server.js"
+    "dev": "node server.js",
+    "demo": "node demo/run_demo.js"
   },
   "keywords": [
-    "fraud-detection",  
+    "fraud-detection",
     "identity-verification",
     "api"
   ],

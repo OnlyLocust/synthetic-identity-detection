@@ -8,39 +8,61 @@ The backend is built with **Node.js** and **Express.js** and follows a modular *
 
 ## 🛠 Features & Detection Rules
 
-The core of the system is the `DetectionEngine`, which implements four key pillars of fraud detection:
+The core of the system is the `DetectionEngine`, which now implements **8 advanced detection layers**:
 
-1.  **Age Mismatch Detection** 🎂
-    *   **Logic:** Compares the user's Date of Birth (DOB) with their estimated `faceAge`.
-    *   **Trigger:** If the variance exceeds ±5 years.
-    *   **Why:** Synthetic identities often use real DOBs (from stolen SSNs) that don't match the actual person's appearance.
+### 1. 🧠 Name Entropy & Anomaly Detection
+*   **Logic:** Calculates Shannon Entropy of the name string.
+*   **Trigger:** Flags names that are too random (high entropy, e.g., "Xqkzjwvy") or too repetitive (low entropy, e.g., "aaaaaaa").
+*   **Why:** Detects bot-generated random names or lazy fraudster inputs.
 
-2.  **Identity Clustering** 🕸️
-    *   **Logic:** Checks if sensitive identifiers (Email, Phone, Device ID) are being shared across multiple *different* user IDs.
-    *   **Trigger:** If `email`, `phone`, or `deviceId` is associated with another known user.
-    *   **Why:** Fraudsters often reuse contact info or devices to manage multiple fake accounts.
+### 2. 📧 Email Risk Assessment
+*   **Logic:** Checks email domain and structure.
+*   **Trigger:** Flags **Disposable Domains** (e.g., `tempmail.com`), **Plus Addressing** (`user+tag@...`), or **Excessive Dots** (`u.s.e.r@...`).
+*   **Why:** Fraudsters use these techniques to bypass "unique email" constraints without managing real accounts.
 
-3.  **Behavioral Pattern Analysis** 🤖
-    *   **Logic:** Analyzes the time taken to complete the registration form (`formTime`).
-    *   **Trigger:** If completion time is unnaturally fast (< 2 seconds).
-    *   **Why:** Indicates automated scripts/bots rather than human interaction.
+### 3. 📅 Document Age Validation
+*   **Logic:** Cross-references `dob` (Date of Birth) with `docIssueDate`.
+*   **Trigger:** Flags if the document was issued *before* the user was born or at an impossible young age.
+*   **Why:** Catches chronological inconsistencies common in synthetic IDs constructed from mismatched data fragments.
 
-4.  **Network Fingerprinting** 🌐
-    *   **Logic:** Analyzes the combination of IP Address and Device ID.
-    *   **Trigger:** If multiple disparate identities originate from the exact same device and network endpoint.
-    *   **Why:** Highly indicative of a "fraud farm" or organized attack.
+### 4. 📱 Phone Velocity Check
+*   **Logic:** Tracks how many distinct identities (`userIds`) share the same phone number.
+*   **Trigger:** **High Warning** if > 2 identities share a number.
+*   **Why:** A single phone number associated with multiple identities is a strong indicator of an organized ring.
+
+### 5. 🕸️ Network Density (IP/Device Clustering)
+*   **Logic:** Analyzes the density of identities sharing a precise `IP` + `DeviceID` combination.
+*   **Trigger:** **Critical Warning** if multiple identities stem from the exact same device signature.
+*   **Why:** Highly indicative of a "fraud farm" or botnet operation.
+
+### 6. 🎭 Face Pattern Matching
+*   **Logic:** Compares the user's facial embedding vector against a blacklist of known fraud embeddings using Cosine Similarity.
+*   **Trigger:** **Critical Warning** if similarity > 0.9.
+*   **Why:** Prevents known bad actors from re-registering under new names.
+
+### 7. 🎂 Age Mismatch Detection (Visual vs. Data)
+*   **Logic:** Compares the user's provided DOB with their estimated `faceAge` from biometric analysis.
+*   **Trigger:** If the variance exceeds ±5 years.
+*   **Why:** Synthetic identities often use stolen real DOBs that don't match the fraudster's actual appearance.
+
+### 8. 🤖 Behavioral Pattern Analysis
+*   **Logic:** Monitor's form completion time (`formTime`).
+*   **Trigger:** If completion time is impossible for a human (< 2 seconds).
+*   **Why:** Flag's automated scripts/bots.
+
+---
 
 ## 🏗 Architecture
 
 The codebase is refactored into a clean, maintainable structure:
 
-*   **`server.js`**: Application entry point. Sets up middleware (CORS, Helmet, Morgan) and mounts routes.
-*   **`routes/`**: Defines API endpoints.
-*   **`controllers/`**: Handles request logic, input validation, and orchestrates the detection process.
-*   **`services/`**: Contains the business logic.
-    *   `detectionEngine.js`: The class containing all the algorithms and scoring logic.
-*   **`data/`**: Stores static reference data.
-    *   `legitimateUsers.json`: A database of trusted/legitimate user profiles used for cross-referencing new applications.
+*   **`server.js`**: Application entry point with security middleware (CORS, Helmet).
+*   **`routes/`**: API endpoint definitions.
+*   **`controllers/`**: Request orchestration and validation.
+*   **`services/`**: 
+    *   `detectionEngine.js`: The "Brain" containing all 8 detailed algorithms and scoring logic.
+*   **`data/`**: Reference data sources.
+*   **`demo/`**: Sandbox for testing and demonstration (contains usage scripts).
 
 ## 🔌 API Endpoints
 
@@ -50,41 +72,48 @@ The codebase is refactored into a clean, maintainable structure:
 Analyzes user data for synthetic fraud.
 
 **Input Format (Single Record):**
-Compares the input against the internal `legitimateUsers.json` database.
 ```json
 {
   "record": {
     "name": "John Doe",
-    "dob": "01-01-1990",
+    "dob": "1990-01-01",
     "email": "john@example.com",
     "phone": "555-0199",
     "faceAge": 33,
     "deviceId": "uuid-v4-hash",
     "ip": "192.168.1.1",
     "formTime": 5000,
-    "userId": "NEW_USER_123"
+    "userId": "NEW_USER_123",
+    "docIssueDate": "2015-06-20",
+    "faceEmbedding": [0.1, 0.2, ...]
   }
 }
 ```
 
-**Input Format (Batch):**
-Analyzes a batch of records for internal consistency and cross-correlation (useful for processing historical logs).
-```json
-{
-  "records": [ ...array of record objects... ]
-}
-```
+**Response:**
+Returns a `riskScore` (0-100), `isSynthetic` (boolean), and a detailed list of triggered `rules`.
 
 ### 2. Health Check
 **GET** `/api/health`
+Returns system status.
 
-Returns the operational status of the API.
-```json
-{
-  "status": "ok",
-  "timestamp": "2024-03-21T10:00:00.000Z"
-}
-```
+## 🧪 Demo & Usage
+
+We have included a built-in demo script to showcase the detection capabilities.
+
+1.  **Run the Demo:**
+    This script reads test cases from `demo/input/test_cases.json` covering various fraud scenarios, processes them through the engine, and outputs the results.
+
+    ```bash
+    npm run demo
+    # OR
+    node demo/run_demo.js
+    ```
+
+2.  **View Results:**
+    *   **Console:** Real-time analysis logs.
+    *   **JSON:** `demo/output/results.json`
+    *   **Summary:** `demo/output/summary.txt`
 
 ## ⚙️ Setup & Installation
 
@@ -98,18 +127,3 @@ Returns the operational status of the API.
     npm run dev
     # Runs on http://localhost:3001
     ```
-
-3.  **Run Production Server:**
-    ```bash
-    npm start
-    ```
-
-## 🧪 Testing
-
-You can test the API using the frontend application or via `curl`:
-
-```bash
-curl -X POST http://localhost:3001/api/analyze \
-  -H "Content-Type: application/json" \
-  -d '{"record": {"name": "Test", "dob": "01-01-2025", "faceAge": 30, ...}}'
-```
