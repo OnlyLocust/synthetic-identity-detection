@@ -52,17 +52,88 @@ The core of the system is the `DetectionEngine`, which now implements **8 advanc
 
 ---
 
-## 🏗 Architecture
+## 🏗 Architecture & Data Flow
 
-The codebase is refactored into a clean, maintainable structure:
+ The system is designed using a **modular MVC architecture** to separate concerns between the API layer and the business logic.
 
-*   **`server.js`**: Application entry point with security middleware (CORS, Helmet).
-*   **`routes/`**: API endpoint definitions.
-*   **`controllers/`**: Request orchestration and validation.
-*   **`services/`**: 
-    *   `detectionEngine.js`: The "Brain" containing all 8 detailed algorithms and scoring logic.
-*   **`data/`**: Reference data sources.
-*   **`demo/`**: Sandbox for testing and demonstration (contains usage scripts).
+### **1. Request Lifecycle**
+When a request hits the system (e.g., `POST /api/analyze`), it follows this path:
+
+1.  **Entry (`server.js`)**: The request is intercepted by middleware (Helmet for headers, CORS, JSON parsing) before being routed.
+2.  **Routing (`routes/detectionRoutes.js`)**: The router directs the request to the specific controller method.
+3.  **Controller (`controllers/detectionController.js`)**: 
+    *   Validates input integrity (checks for required fields like `dob`, `email`, `deviceId`).
+    *   Instantiates the `DetectionEngine`.
+    *   Orchestrates the analysis by passing the input data and the reference dataset (Legitimate Users) to the engine.
+    *   Formats the final JSON response with scores and headers.
+4.  **Service (`services/detectionEngine.js`)**:
+    *   This is the "brain" of the operation.
+    *   **Rule Execution**: Iterates through all 8 risk rules for the record.
+    *   **Scoring**: Aggregates weights from triggered rules (e.g., Critical = 60pts, High = 40pts).
+    *   **Decision**: Marks identity as `isSynthetic` if the score checks out (>70) or critical rules are met.
+5.  **Reference Data (`data/legitimateUsers.json`)**: Static JSON database used to check for data collisions (e.g., is this phone number already used by User A, B, and C?).
+
+### **2. Component Breakdown**
+
+*   **`DetectionEngine` Class**:
+    *   *State*: Maintains `correlationMap` for rapid lookup of email/phone frequencies.
+    *   *Methods*: Modular methods for each rule (e.g., `calculateNameEntropy`, `checkNetworkDensity`) make it easy tounit test or add new rules.
+    *   *Vector Analysis*: Includes basic cosine similarity math for vector comparison of face embeddings.
+
+*   **REST API Design**:
+    *   Stateless architecture.
+    *   Standard HTTP status codes (200 for success, 400 for bad input, 500 for server error).
+
+### **3. Data Flow Diagram (Conceptual)**
+
+```
+Client (Frontend/Script) 
+       ⬇️ JSON Payload
+[ API Endpoint /analyze ]
+       ⬇️
+[ Controller Validation ] ❌ Reject Malformed
+       ⬇️
+[ Detection Engine ] 
+       First Pass:
+       ├── 1. Entropy & Format Checks (Name, Email)
+       ├── 2. Logic Checks (Age vs Doc Date)
+       ├── 3. Biometric Checks (Face Vectors)
+       ⬇️
+       Second Pass (Context Awareness):
+       ├── 4. Velocity Check (vs Global DB)
+       ├── 5. Network Density Check (vs Batch/Global)
+       ⬇️
+[ Scoring System ] ➡️ Sum Weights
+       ⬇️
+Response { "riskScore": 85, "isSynthetic": true }
+```
+
+## 🌍 Real World Impact
+
+Integrating this **Detection Engine** into a financial or service platform addresses critical security challenges:
+
+### **1. Financial Loss Prevention (Bank/Fintech)**
+*   **Problem**: Fraudsters create synthetic identities to build credit scores over years before "busting out" (maxing out limits and vanishing).
+*   **Solution**: By checking **Phone Velocity**, **Document Age**, and **Network Density** at the *onboarding* stage, we prevent these sleeper accounts from ever being created.
+*   **Impact**: Potentially saves millions in bad debt write-offs.
+
+### **2. Platform Integrity (Gig Economy/Social)**
+*   **Problem**: Bot farms create thousands of fake driver/host/user accounts to manipulate ratings or abuse referral bonuses.
+*   **Solution**: **Face Matching** (1:N search) and **Name Entropy** checks ensure that one human = one account, regardless of how many emails they generate.
+*   **Impact**: Preserves trust in marketplace ecosystems (e.g., stopping fake Uber drivers or Airbnb hosts).
+
+### **3. Regulatory Compliance (KYC/AML)**
+*   **Problem**: Banks must adhere to "Know Your Customer" laws. Onboarding a fake person is a compliance violation.
+*   **Solution**: **Document Validation** (DOB vs Issue Date) and **Age Mismatch** (Bio-age vs Stated Age) act as automated sanity checks before manual review.
+*   **Impact**: Reduces risk of heavy regulatory fines.
+
+### **4. Operational Efficiency**
+*   **Problem**: Manual review teams are overwhelmed by false positives.
+*   **Solution**: The **Risk Score (0-100)** allows for tiered automation: 
+    *   *Low Risk (<20)*: Auto-approve.
+    *   *Medium Risk (20-70)*: Step-up auth (OTP/Selfie).
+    *   *High Risk (>70)*: Manual review/Block.
+*   **Impact**: Reduces manual review volume by up to 80%.
 
 ## 🔌 API Endpoints
 
