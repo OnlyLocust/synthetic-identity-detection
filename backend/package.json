@@ -7,7 +7,11 @@
     "start": "node server.js",
     "dev": "node server.js"
   },
-  "keywords": ["fraud-detection", "identity-verification", "api"],
+  "keywords": [
+    "fraud-detection",
+    "identity-verification",
+    "api"
+  ],
   "author": "",
   "license": "ISC",
   "dependencies": {
