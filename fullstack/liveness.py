@@ -1,304 +1,247 @@
-import requests
-
-# URL to download the FaceLandmarker model
-model_url = "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task"
-model_name = "face_landmarker.task"
-
-# Download the model
-print(f"Downloading {model_name}...")
-response = requests.get(model_url, stream=True)
-response.raise_for_status() # Raise an exception for bad status codes
-
-with open(model_name, "wb") as f:
-    for chunk in response.iter_content(chunk_size=8192):
-        f.write(chunk)
-
-print(f"{model_name} downloaded successfully.")
 import cv2
 import mediapipe as mp
-import numpy as np
 import time
+import math
+import numpy as np
+from collections import deque
+from enum import Enum
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 
+class LivenessState(Enum):
+    WAITING = "WAITING"
+    CHALLENGE_ACTIVE = "CHALLENGE_ACTIVE"
+    SUCCESS = "SUCCESS"
+    FAILED = "FAILED"
+
+class LivenessSession:
+    """Manages the state and data for a single liveness detection session."""
+    def __init__(self, challenge_type="BLINK", time_limit=10.0):
+        self.state = LivenessState.WAITING
+        self.challenge_type = challenge_type  # BLINK, NOD, TURN
+        self.start_time = time.time()
+        self.time_limit = time_limit
+        
+        # Counters and data
+        self.blink_count = 0
+        self.blink_frames = 0
+        self.is_blink_active = False
+        
+        # Pose data
+        self.last_yaw = 0.0
+        self.last_pitch = 0.0
+        self.last_ear = 0.0
+        
+        # Buffers for smoothing
+        self.yaw_buffer = deque(maxlen=5)
+        self.pitch_buffer = deque(maxlen=5)
+        self.ear_buffer = deque(maxlen=5)
+        
+        self.verified = False
+
+    def reset(self, challenge_type=None):
+        """Explicitly reset all state variables."""
+        if challenge_type:
+            self.challenge_type = challenge_type
+        self.state = LivenessState.WAITING
+        self.start_time = time.time()
+        self.blink_count = 0
+        self.blink_frames = 0
+        self.is_blink_active = False
+        self.last_yaw = 0.0
+        self.last_pitch = 0.0
+        self.last_ear = 0.0
+        self.yaw_buffer.clear()
+        self.pitch_buffer.clear()
+        self.ear_buffer.clear()
+        self.verified = False
+        print(f"Session Reset: Challenge set to {self.challenge_type}")
 
 class LivenessEngine:
     """
-    Face liveness detection engine using MediaPipe Face Landmarker.
-    Detects blinks and performs anti-spoofing checks.
+    Enhanced liveness detection engine using MediaPipe.
     """
-    
     def __init__(self, model_path='face_landmarker.task'):
-        """
-        Initialize the liveness detection engine.
-        
-        Args:
-            model_path: Path to the MediaPipe face landmarker model file
-        """
-        # Configure FaceLandmarker options
+        # Initialize MediaPipe Face Landmarker
         base_options = python.BaseOptions(model_asset_path=model_path)
         options = vision.FaceLandmarkerOptions(
             base_options=base_options,
-            output_face_blendshapes=False,
-            output_facial_transformation_matrixes=False,
+            output_face_blendshapes=True,
+            output_facial_transformation_matrixes=True,
             num_faces=1
         )
-        
-        # Instantiate FaceLandmarker
         self.face_landmarker = vision.FaceLandmarker.create_from_options(options)
         
-        # Eye landmarks for EAR calculation (MediaPipe indices)
+        # Eye indices (MediaPipe)
+        # Left Eye EAR indices: outer, top1, top2, inner, bottom1, bottom2
         self.LEFT_EYE = [362, 385, 387, 263, 373, 380]
+        # Right Eye EAR indices: outer, top1, top2, inner, bottom1, bottom2
         self.RIGHT_EYE = [33, 160, 158, 133, 153, 144]
         
-        # Session state
-        self.sessions = {}
+        # Detection Thresholds
+        self.EAR_THRESHOLD = 0.20
+        self.POSE_THRESHOLD = 15.0  # Degrees
+        self.DEBOUNCE_FRAMES = 2    # Min frames to count as blink
         
-        # Configurable thresholds
-        self.EAR_THRESHOLD = 0.2
-        self.VARIANCE_THRESHOLD = 0.00001
-        self.HISTORY_LENGTH = 30
-        self.REQUIRED_BLINKS = 2
-        self.TIME_LIMIT = 10.0
-        self.SESSION_TIMEOUT = 15.0
-    
-    def calculate_ear(self, landmarks, eye_indices):
-        """
-        Calculate Eye Aspect Ratio (EAR) for blink detection.
-        
-        Args:
-            landmarks: List of NormalizedLandmark objects
-            eye_indices: Indices of eye landmarks
-            
-        Returns:
-            float: Eye Aspect Ratio value
-        """
-        coords = [np.array([landmarks[i].x, landmarks[i].y]) for i in eye_indices]
-        
-        # EAR = (||p2-p6|| + ||p3-p5||) / (2 * ||p1-p4||)
-        d1 = np.linalg.norm(coords[1] - coords[5])
-        d2 = np.linalg.norm(coords[2] - coords[4])
-        d3 = np.linalg.norm(coords[0] - coords[3])
-        
-        if d3 == 0:
-            return 0.0
-        
-        return (d1 + d2) / (2.0 * d3)
-    
-    def _initialize_session(self, session_id):
-        """Initialize a new session for a user."""
-        self.sessions[session_id] = {
-            "blink_count": 0,
-            "last_blink_time": 0,
-            "start_time": time.time(),
-            "landmarks_history": [],
-            "is_closed": False
-        }
-    
-    def process_frame(self, session_id, frame_data):
-        """
-        Process a video frame for liveness detection.
-        
-        Args:
-            session_id: Unique identifier for the session
-            frame_data: BGR image as numpy array
-            
-        Returns:
-            dict: Detection results including status, blink count, and liveness
-        """
-        # Convert BGR to RGB for MediaPipe
-        mp_image = mp.Image(
-            image_format=mp.ImageFormat.SRGB,
-            data=cv2.cvtColor(frame_data, cv2.COLOR_BGR2RGB)
-        )
-        
-        # Perform face landmark detection
-        detection_result = self.face_landmarker.detect(mp_image)
-        
-        # Initialize session if needed
-        if session_id not in self.sessions:
-            self._initialize_session(session_id)
-        
-        session = self.sessions[session_id]
-        current_time = time.time()
-        
-        # Check if face is detected
-        if not detection_result.face_landmarks:
-            return {
-                "status": "no_face",
-                "blinkCount": session["blink_count"],
-                "isLive": False,
-                "variance": 0.0,
-                "verified": False
-            }
-        
-        # Get landmarks for the first detected face
-        landmarks = detection_result.face_landmarks[0]
-        
-        # 1. Eye Aspect Ratio (EAR) for blink detection
-        left_ear = self.calculate_ear(landmarks, self.LEFT_EYE)
-        right_ear = self.calculate_ear(landmarks, self.RIGHT_EYE)
-        avg_ear = (left_ear + right_ear) / 2.0
-        
-        # Blink detection
-        if avg_ear < self.EAR_THRESHOLD:
-            if not session["is_closed"]:
-                session["is_closed"] = True
-        else:
-            if session["is_closed"]:
-                session["blink_count"] += 1
-                session["last_blink_time"] = current_time
-                session["is_closed"] = False
-        
-        # 2. Anti-spoofing: Track nose tip movement variance
-        nose_tip = np.array([landmarks[1].x, landmarks[1].y, landmarks[1].z])
-        session["landmarks_history"].append(nose_tip)
-        
-        # Keep only recent history
-        if len(session["landmarks_history"]) > self.HISTORY_LENGTH:
-            session["landmarks_history"].pop(0)
-        
-        # Calculate variance to detect static images
-        variance = 0.0
-        if len(session["landmarks_history"]) > 10:
-            variance = np.var(session["landmarks_history"], axis=0).sum()
-        
-        is_static = variance < self.VARIANCE_THRESHOLD
-        
-        # 3. Verification: Check if requirements are met
-        time_elapsed = current_time - session["start_time"]
-        verified = (
-            session["blink_count"] >= self.REQUIRED_BLINKS and 
-            time_elapsed <= self.TIME_LIMIT and
-            not is_static
-        )
-        
-        # Clean up old sessions
-        if time_elapsed > self.SESSION_TIMEOUT:
-            self.sessions.pop(session_id)
-            return {
-                "status": "timeout",
-                "blinkCount": session["blink_count"],
-                "isLive": not is_static,
-                "variance": float(variance),
-                "verified": False
-            }
-        
-        return {
-            "status": "verified" if verified else "processing",
-            "blinkCount": session["blink_count"],
-            "isLive": not is_static,
-            "variance": float(variance),
-            "verified": verified,
-            "timeElapsed": time_elapsed,
-            "avgEAR": avg_ear
-        }
-    
-    def reset_session(self, session_id):
-        """Reset a session's state."""
-        if session_id in self.sessions:
-            self.sessions.pop(session_id)
-    
-    def __del__(self):
-        """Cleanup resources."""
-        if hasattr(self, 'face_landmarker'):
-            self.face_landmarker.close()
-import cv2
+        self.session = LivenessSession()
 
+    def calculate_ear(self, landmarks):
+        """Calculate Eye Aspect Ratio (EAR)."""
+        def eye_ear(eye_indices):
+            p = [landmarks[i] for i in eye_indices]
+            # p[0]=outer, p[1]=top1, p[2]=top2, p[3]=inner, p[4]=bottom1, p[5]=bottom2
+            vertical1 = math.sqrt((p[1].x - p[5].x)**2 + (p[1].y - p[5].y)**2)
+            vertical2 = math.sqrt((p[2].x - p[4].x)**2 + (p[2].y - p[4].y)**2)
+            horizontal = math.sqrt((p[0].x - p[3].x)**2 + (p[0].y - p[3].y)**2)
+            return (vertical1 + vertical2) / (2.0 * horizontal + 1e-6)
+
+        left_ear = eye_ear(self.LEFT_EYE)
+        right_ear = eye_ear(self.RIGHT_EYE)
+        return (left_ear + right_ear) / 2.0
+
+    def extract_pose(self, matrix):
+        """Extract Yaw and Pitch from transformation matrix."""
+        # MediaPipe matrix is 4x4. Rotation is the top-left 3x3.
+        # r20 = -sin(yaw)
+        yaw = -math.asin(matrix[0, 2])
+        # r21 = sin(pitch) * cos(yaw)
+        pitch = math.atan2(matrix[1, 2], matrix[2, 2])
+        return math.degrees(yaw), math.degrees(pitch)
+
+    def process_frame(self, frame):
+        # Convert BGR to RGB
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
+        
+        result = self.face_landmarker.detect(mp_image)
+        
+        if not result.face_landmarks:
+            return None, "NO_FACE"
+
+        landmarks = result.face_landmarks[0]
+        
+        # Get Pose
+        yaw, pitch = 0.0, 0.0
+        if result.facial_transformation_matrixes:
+            yaw, pitch = self.extract_pose(result.facial_transformation_matrixes[0])
+        
+        # Get EAR
+        ear = self.calculate_ear(landmarks)
+        
+        # Smooth values using buffers
+        self.session.ear_buffer.append(ear)
+        self.session.yaw_buffer.append(yaw)
+        self.session.pitch_buffer.append(pitch)
+        
+        smooth_ear = sum(self.session.ear_buffer) / len(self.session.ear_buffer)
+        smooth_yaw = sum(self.session.yaw_buffer) / len(self.session.yaw_buffer)
+        smooth_pitch = sum(self.session.pitch_buffer) / len(self.session.pitch_buffer)
+        
+        self.session.last_ear = smooth_ear
+        self.session.last_yaw = smooth_yaw
+        self.session.last_pitch = smooth_pitch
+        
+        # State Machine Logic
+        current_time = time.time()
+        elapsed = current_time - self.session.start_time
+        remaining = max(0, self.session.time_limit - elapsed)
+
+        if self.session.state == LivenessState.WAITING:
+            self.session.state = LivenessState.CHALLENGE_ACTIVE
+            self.session.start_time = current_time
+            
+        elif self.session.state == LivenessState.CHALLENGE_ACTIVE:
+            if remaining <= 0:
+                self.session.state = LivenessState.FAILED
+            else:
+                self.verify_challenge(smooth_ear, smooth_yaw, smooth_pitch)
+                if self.session.verified:
+                    self.session.state = LivenessState.SUCCESS
+
+        return result, remaining
+
+    def verify_challenge(self, ear, yaw, pitch):
+        s = self.session
+        if s.challenge_type == "BLINK":
+            if ear < self.EAR_THRESHOLD:
+                s.blink_frames += 1
+                if s.blink_frames >= self.DEBOUNCE_FRAMES and not s.is_blink_active:
+                    s.is_blink_active = True
+            else:
+                if s.is_blink_active:
+                    s.blink_count += 1
+                    s.is_blink_active = False
+                s.blink_frames = 0
+            
+            if s.blink_count >= 2:
+                s.verified = True
+
+        elif s.challenge_type == "TURN":
+            # Success if yaw exceeds threshold (Look Left/Right)
+            if abs(yaw) > self.POSE_THRESHOLD:
+                s.verified = True
+                
+        elif s.challenge_type == "NOD":
+            # Success if pitch exceeds threshold (Look Up/Down)
+            if abs(pitch) > self.POSE_THRESHOLD:
+                s.verified = True
 
 def main():
-    """
-    Test the liveness detection engine with webcam input.
-    Press 'q' to quit, 'r' to reset session.
-    """
-    # Initialize camera
     cap = cv2.VideoCapture(0)
+    engine = LivenessEngine()
+    
+    challenges = ["BLINK", "NOD", "TURN"]
+    current_idx = 0
+    engine.session.reset(challenge_type=challenges[current_idx])
 
-    if not cap.isOpened():
-        print("Error: Could not open webcam")
-        return
-
-    # Initialize liveness engine
-    try:
-        engine = LivenessEngine(model_path='face_landmarker.task')
-    except Exception as e:
-        print(f"Error initializing engine: {e}")
-        print("Make sure 'face_landmarker.task' is in the current directory")
-        print("Download from: https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/latest/face_landmarker.task")
-        cap.release()
-        return
-
-    session_id = "test_user_123"
-
-    print("Liveness Detection Started")
-    print("Instructions:")
-    print("- Look at the camera and blink naturally")
-    print("- You need to blink 2 times within 10 seconds")
-    print("- Press 'q' to quit")
-    print("- Press 'r' to reset session")
-    print("-" * 50)
+    print("Advanced Liveness Detection Started")
+    print("Press 'q' to quit, 'r' to rotate challenge and reset")
 
     while cap.isOpened():
         ret, frame = cap.read()
-        if not ret:
-            print("Failed to grab frame")
-            break
+        if not ret: break
 
-        # Process the frame
-        result = engine.process_frame(session_id, frame)
+        frame = cv2.flip(frame, 1) # Mirror
+        detection, remaining = engine.process_frame(frame)
+        session = engine.session
+        
+        # UI Rendering
+        h, w, _ = frame.shape
+        color = (0, 255, 0) if session.state == LivenessState.SUCCESS else (0, 0, 255) if session.state == LivenessState.FAILED else (255, 165, 0)
+        
+        # Title and State
+        cv2.putText(frame, f"STATE: {session.state.value}", (20, 40), cv2.FONT_HERSHEY_DUPLEX, 0.8, color, 2)
+        cv2.putText(frame, f"TASK: {session.challenge_type}", (20, 80), cv2.FONT_HERSHEY_DUPLEX, 0.8, (255, 255, 255), 2)
+        
+        # Progress & Timer
+        if session.state == LivenessState.CHALLENGE_ACTIVE:
+            timer_color = (0, 0, 255) if remaining < 3 else (255, 255, 255)
+            cv2.putText(frame, f"Time Left: {remaining:.1f}s", (w - 200, 40), cv2.FONT_HERSHEY_DUPLEX, 0.7, timer_color, 2)
+            
+            if session.challenge_type == "BLINK":
+                cv2.putText(frame, f"Blinks: {session.blink_count}/2", (20, 120), cv2.FONT_HERSHEY_DUPLEX, 0.7, (200, 200, 200), 2)
+            else:
+                cv2.putText(frame, "Awaiting Movement...", (20, 120), cv2.FONT_HERSHEY_DUPLEX, 0.7, (200, 200, 200), 2)
 
-        # Determine display color
-        if result["verified"]:
-            color = (0, 255, 0)  # Green
-            status_text = "VERIFIED"
-        elif result["status"] == "no_face":
-            color = (0, 0, 255)  # Red
-            status_text = "NO FACE DETECTED"
-        elif result["status"] == "timeout":
-            color = (0, 165, 255)  # Orange
-            status_text = "TIMEOUT - Press 'r' to retry"
-        else:
-            color = (255, 255, 0)  # Yellow
-            status_text = "PROCESSING"
+        # Debug Corner
+        debug_rect = (w - 210, h - 110, 200, 100)
+        cv2.rectangle(frame, (debug_rect[0], debug_rect[1]), (debug_rect[0] + debug_rect[2], debug_rect[1] + debug_rect[3]), (0, 0, 0), -1)
+        cv2.putText(frame, f"EAR: {session.last_ear:.3f}", (w - 200, h - 80), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+        cv2.putText(frame, f"Yaw: {session.last_yaw:.1f}", (w - 200, h - 55), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+        cv2.putText(frame, f"Pitch: {session.last_pitch:.1f}", (w - 200, h - 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
 
-        # Display information on frame
-        cv2.putText(frame, status_text, (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2)
+        cv2.imshow('Liveness Detection Refactored', frame)
 
-        cv2.putText(frame, f"Blinks: {result['blinkCount']}/2", (10, 70),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
-
-        cv2.putText(frame, f"Live: {result['isLive']}", (10, 110),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
-
-        cv2.putText(frame, f"Variance: {result['variance']:.6f}", (10, 150),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
-
-        if 'timeElapsed' in result:
-            cv2.putText(frame, f"Time: {result['timeElapsed']:.1f}s / 10s", (10, 190),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
-
-        if 'avgEAR' in result:
-            cv2.putText(frame, f"EAR: {result['avgEAR']:.3f}", (10, 230),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
-
-        # Show the frame
-        cv2.imshow('Liveness Detection', frame)
-
-        # Handle key presses
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q'):
-            print("Exiting...")
             break
         elif key == ord('r'):
-            print("Resetting session...")
-            engine.reset_session(session_id)
+            current_idx = (current_idx + 1) % len(challenges)
+            engine.session.reset(challenge_type=challenges[current_idx])
 
-    # Cleanup
     cap.release()
     cv2.destroyAllWindows()
-    print("Cleanup complete")
-
+    print("Session Ended.")
 
 if __name__ == "__main__":
     main()
