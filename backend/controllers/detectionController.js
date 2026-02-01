@@ -117,7 +117,97 @@ const healthCheck = (req, res) => {
     res.json({ status: 'ok', timestamp: new Date().toISOString() });
 };
 
+const unifiedAnalysis = (req, res) => {
+    try {
+        const { record, behavior, biometric } = req.body;
+
+        // 1. Core Identity Detection
+        const engine = new DetectionEngine();
+
+        // Ensure record has defaults for fields not in form
+        const fullRecord = {
+            ...record,
+            ip: record.ip || "127.0.0.1",
+            formTime: behavior ? 5000 : record.formTime // mock or use behavior
+        };
+
+        const identityResult = engine.analyzeSingle(fullRecord, legitimateUsers);
+        const identityScore = identityResult.analysis.riskScore;
+
+        const behaviorService = require('../services/behaviorService');
+
+        // ... (in unifiedAnalysis) ...
+
+        // 2. Behavioral Scoring (Advanced)
+        let behaviorScore = 0;
+        let behaviorDetails = {};
+
+        if (behavior && behavior.events) {
+            const behaviorAnalysis = behaviorService.analyzeBehavior(behavior.events);
+            behaviorScore = parseFloat(behaviorAnalysis.behaviorScore) * 100; // normalized 0-100? No, service returns 1.0 = good.
+            // Service returns: behaviorScore (1.0 = good, 0.0 = bad), syntheticRiskScore (0-100, high = bad)
+
+            // We want Risk Score (0-100, High = Bad)
+            behaviorScore = behaviorAnalysis.syntheticRiskScore;
+            behaviorDetails = behaviorAnalysis.details;
+        } else if (behavior) {
+            // Fallback for limited data (e.g. just velocity)
+            if (behavior.velocity === 0 || behavior.velocity > 5) behaviorScore += 30;
+            if (behavior.avgKeystroke < 50) behaviorScore += 40;
+        }
+
+        // 3. Age Verification
+        // Logic: Compare DOB year with Visual Age
+        let ageMatchScore = 0;
+        let isSyntheticAge = false;
+
+        if (record.dob && biometric && biometric.visualAge) {
+            const birthYear = new Date(record.dob).getFullYear();
+            const currentYear = new Date().getFullYear();
+            const statedAge = currentYear - birthYear;
+            const diff = Math.abs(statedAge - biometric.visualAge);
+
+            // Standard variance map
+            if (diff > 10) ageMatchScore = 80;
+            else if (diff > 5) ageMatchScore = 40;
+            else if (diff > 3) ageMatchScore = 15;
+
+            if (diff > 7) isSyntheticAge = true;
+        }
+
+        // Aggregation: Unified Trust Score — Identity (40%), Behavior (30%), Biometrics (30%)
+        let compositeScore = Math.round(
+            (identityScore * 0.4) + (behaviorScore * 0.3) + (ageMatchScore * 0.3)
+        );
+
+        // Override if critical flags in identity
+        if (identityResult.analysis.isSynthetic || isSyntheticAge) {
+            // Boost score if logic suggests synthetic
+            compositeScore = Math.max(compositeScore, 75);
+        }
+
+        const breakdown = {
+            identityScore,
+            behaviorScore,
+            ageMatchScore,
+            isSynthetic: compositeScore > 70
+        };
+
+        res.json({
+            success: true,
+            compositeScore,
+            breakdown,
+            details: identityResult.analysis.reasons // Identity reasons
+        });
+
+    } catch (error) {
+        console.error("Unified Analysis Error", error);
+        res.status(500).json({ error: "Aggregator Failed" });
+    }
+};
+
 module.exports = {
     analyzeRecords,
-    healthCheck
+    healthCheck,
+    unifiedAnalysis
 };

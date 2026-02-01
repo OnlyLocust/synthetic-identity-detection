@@ -5,6 +5,11 @@ module.exports = {
   theme: {
     extend: {
       colors: {
+        echelon: {
+          obsidian: '#0B0B0F',
+          purple: '#9333EA',
+          indigo: '#6366F1',
+        },
         border: "hsl(var(--border))",
         input: "hsl(var(--input))",
         ring: "hsl(var(--ring))",
